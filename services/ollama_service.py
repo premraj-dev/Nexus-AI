@@ -2,22 +2,26 @@
 from dotenv import load_dotenv
 from groq import Groq
 
-load_dotenv()
+# Explicitly load .env file from working directory
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env"), override=True)
+load_dotenv(override=True)
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 def generate_llm_response(prompt: str, system_prompt: str = "", model: str = "llama-3.1-8b-instant") -> str:
-    if not client:
-        return "Error: GROQ_API_KEY environment variable not set."
+    key = os.getenv("GROQ_API_KEY", "")
+    if not key:
+        return "Error: GROQ_API_KEY environment variable not set in .env file."
     
+    local_client = Groq(api_key=key)
+
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": prompt})
 
     try:
-        response = client.chat.completions.create(
+        response = local_client.chat.completions.create(
             messages=messages,
             model=model,
             temperature=0.7,
