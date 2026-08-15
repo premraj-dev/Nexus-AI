@@ -1,53 +1,59 @@
-from services.ollama_service import ollama_service
-from models.schemas import DualOption, OverseerEvaluation, RouterDecision
+﻿from services.ollama_service import ollama_service
+from models.schemas import DualOption, ConvergenceCheck, ClarificationQuestions
+from prompts.agent_prompts import (
+    CLARIFICATION_SYSTEM_PROMPT,
+    IDEATOR_OPENING_PROMPT,
+    IDEATOR_REBUTTAL_PROMPT,
+    CRITIC_OPENING_PROMPT,
+    CRITIC_REBUTTAL_PROMPT,
+    CONVERGENCE_SYSTEM_PROMPT,
+)
 
-class RouterAgent:
-    """Agent 0: Classifies the user query into DIRECT, EXPERT, DECISION, or CLARIFY."""
-    def run(self, query: str) -> RouterDecision:
-        system_prompt = (
-            "You are the ROUTER for an AI system. Classify the query into strictly ONE mode:\n"
-            "- DIRECT: simple factual questions, recipes, definitions, general how-to with one main answer.\n"
-            "- EXPERT: coding tasks, debugging, specialist output.\n"
-            "- DECISION: queries with real trade-offs between valid competing technical/business/strategic choices.\n"
-            "- CLARIFY: queries missing critical constraints (like budget, scale, or preferences).\n"
-            "Rules:\n"
-            "1. Default to DIRECT.\n"
-            "2. 'Best chicken curry recipe' = DIRECT.\n"
-            "3. 'Which database to pick' = DECISION."
-        )
-        return ollama_service.generate_structured(system_prompt, f"Classify this query: {query}", RouterDecision)
 
-class DirectAgent:
-    """Handles DIRECT mode queries naturally without agent meta-language."""
-    def run(self, query: str) -> str:
-        prompt = (
-            "You are a helpful assistant. Answer the user query directly and completely.\n"
-            "Do NOT use agent labels, taglines, ratings, or Overseer verdicts.\n"
-            "Give a clear, direct answer (e.g., full recipe with ingredients and steps)."
+class ClarificationAgent:
+    """LLM3 — runs the clarification interview. Every query goes through this first,
+    no router/mode split anymore."""
+
+    def run(self, user_query: str) -> ClarificationQuestions:
+        return ollama_service.generate_structured(
+            CLARIFICATION_SYSTEM_PROMPT, f"User query: {user_query}", ClarificationQuestions
         )
-        return ollama_service.generate(f"{prompt}\n\nUser query: {query}")
+
 
 class IdeatorAgent:
-    def run(self, context: str) -> DualOption:
-        system_prompt = "You are Agent 1. Provide the best primary option with 2-4 points."
-        return ollama_service.generate_structured(system_prompt, context, DualOption)
+    """LLM1 — proposes and defends Option A across debate rounds."""
+
+    def opening(self, context: str) -> DualOption:
+        return ollama_service.generate_structured(IDEATOR_OPENING_PROMPT, context, DualOption)
+
+    def rebuttal(self, context: str, transcript_so_far: str) -> DualOption:
+        prompt = f"{context}\n\nDebate transcript so far:\n{transcript_so_far}"
+        return ollama_service.generate_structured(IDEATOR_REBUTTAL_PROMPT, prompt, DualOption)
+
 
 class CriticAgent:
-    def run(self, context: str) -> DualOption:
-        system_prompt = "You are Agent 2. Provide a strong alternative option with 2-4 points."
-        return ollama_service.generate_structured(system_prompt, context, DualOption)
+    """LLM2 — challenges Option A and proposes/defends Option B."""
 
-class OverseerAgent:
-    def run(self, context: str, option_a: DualOption, option_b: DualOption) -> OverseerEvaluation:
-        system_prompt = (
-            "You are the Overseer AI. Pick ONE best option and explain why in 1 simple sentence. "
-            "Never use internal jargon."
+    def opening(self, context: str, option_a: DualOption) -> DualOption:
+        prompt = f"{context}\n\nOption A proposed by LLM1:\n{option_a.model_dump_json()}"
+        return ollama_service.generate_structured(CRITIC_OPENING_PROMPT, prompt, DualOption)
+
+    def rebuttal(self, context: str, transcript_so_far: str) -> DualOption:
+        prompt = f"{context}\n\nDebate transcript so far:\n{transcript_so_far}"
+        return ollama_service.generate_structured(CRITIC_REBUTTAL_PROMPT, prompt, DualOption)
+
+
+class ConvergenceAgent:
+    """LLM3 — judges per-round whether the debate has converged.
+    Never picks a winner; that's the human user's call, made in the UI."""
+
+    def run(self, transcript_so_far: str) -> ConvergenceCheck:
+        return ollama_service.generate_structured(
+            CONVERGENCE_SYSTEM_PROMPT, f"Debate transcript:\n{transcript_so_far}", ConvergenceCheck
         )
-        eval_context = f"Context:\n{context}\n\nOpt A:\n{option_a.model_dump_json()}\n\nOpt B:\n{option_b.model_dump_json()}"
-        return ollama_service.generate_structured(system_prompt, eval_context, OverseerEvaluation)
 
-router_agent = RouterAgent()
-direct_agent = DirectAgent()
+
+clarification_agent = ClarificationAgent()
 ideator_agent = IdeatorAgent()
 critic_agent = CriticAgent()
-overseer_agent = OverseerAgent()
+convergence_agent = ConvergenceAgent()

@@ -1,54 +1,53 @@
-﻿import json
-import logging
-from llm_client import call_local_llm, parse_json_response
-import orchestrator
+﻿import re
+import datetime
+from services.rag_service import rag_service
+from llm1_debater import run_llm1
+from llm2_debater import run_llm2
+from llm3_referee import evaluate_and_referee
+from llm_client import call_local_llm
 
-logging.basicConfig(
-    filename="system_routing.log",
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+def is_time_sensitive(prompt: str) -> bool:
+    # Rule 1: Year regex + temporal keywords detection
+    temporal_pattern = r'\b(2025|2026|2027|latest|current|today|yesterday|upcoming|releasing|this week|next month)\b'
+    return bool(re.search(temporal_pattern, prompt, re.IGNORECASE))
 
-MODEL = "llama3.2:3b"
-
-ROUTER_PROMPT = """You are the ROUTER for an AI system. Classify the user query into strictly ONE mode:
-
-DIRECT: simple factual questions, recipes, definitions, or standard how-to questions.
-EXPERT: code generation, script writing, debugging, or specialist execution.
-DECISION: complex architectural trade-offs, strategic choices, or competing options.
-CLARIFY: queries missing critical constraints (such as budget, tech stack, or scale) needed to answer accurately.
-
-Output STRICT JSON only:
-{"mode": "DIRECT" | "EXPERT" | "DECISION" | "CLARIFY", "reason": "<one short sentence>"}"""
-
-DIRECT_PROMPT = "You are a helpful assistant. Provide a complete, direct answer without metadata, labels, or agent talk."
-EXPERT_PROMPT = "You are a specialist technical assistant. Deliver a concise, working solution or code snippet without unnecessary commentary."
-CLARIFY_PROMPT = "Ask 2-3 short, numbered clarifying questions needed to narrow down constraints before providing an answer."
-
-def route_and_execute(user_query: str, user_context: str = "") -> dict:
-    raw_route = call_local_llm(ROUTER_PROMPT, f"Query: {user_query}", model=MODEL)
-    try:
-        route_data = parse_json_response(raw_route)
-        mode = route_data.get("mode", "DIRECT")
-    except Exception:
-        mode = "DIRECT"
-
-    rounds_run = 0
-    if mode == "DIRECT":
-        output = call_local_llm(DIRECT_PROMPT, user_query, model=MODEL)
-    elif mode == "EXPERT":
-        output = call_local_llm(EXPERT_PROMPT, user_query, model=MODEL)
-    elif mode == "CLARIFY":
-        output = call_local_llm(CLARIFY_PROMPT, user_query, model=MODEL)
-    elif mode == "DECISION":
-        output, transcript, rounds_run = orchestrator.run_debate(user_query, user_context)
+def route_and_execute(prompt: str) -> dict:
+    time_flag = is_time_sensitive(prompt)
+    
+    if time_flag:
+        # Rule 2: Force mandatory live research
+        research_data = rag_service.fetch_research(prompt)
+        research_context = f"STRUCTURED 2026 METADATA:\n{research_data['structured_data']}\n\nRAW SNIPPETS:\n{research_data['raw_context']}"
     else:
-        output = call_local_llm(DIRECT_PROMPT, user_query, model=MODEL)
+        research_context = "No temporal research required for general non-time-sensitive query."
 
-    logging.info(f"QUERY: '{user_query}' | MODE: {mode} | ROUNDS: {rounds_run}")
+    transcript = ""
+    max_rounds = 2
+    current_round = 1
+    final_answer = ""
+    
+    while current_round <= max_rounds:
+        # Debaters receive query + structured temporal research context
+        op1 = run_llm1(prompt, research_context, transcript)
+        transcript += f"\n--- Round {current_round} [LLM 1] ---\n{op1}\n"
+        
+        op2 = run_llm2(prompt, research_context, transcript)
+        transcript += f"\n--- Round {current_round} [LLM 2] ---\n{op2}\n"
+        
+        # Referee enforces temporal validation
+        eval_result = evaluate_and_referee(prompt, research_context, transcript, current_round, time_flag)
+        
+        if eval_result.get("stop", False) or current_round == max_rounds:
+            final_answer = eval_result.get("final_response", "")
+            if not final_answer:
+                final_answer = op2 if op2 else op1
+            break
+            
+        current_round += 1
 
     return {
-        "mode": mode,
-        "output": output,
-        "rounds_run": rounds_run
+        "mode": "MULTI_AGENT_DEBATE",
+        "time_sensitive": time_flag,
+        "rounds": current_round,
+        "response": final_answer
     }

@@ -1,7 +1,9 @@
-﻿langgraph
+langgraph
 langchain-core
 streamlit
 pydantic
 pydantic-settings
 requests
 python-dotenv
+groq
+
