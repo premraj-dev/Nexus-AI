@@ -1,13 +1,37 @@
 ﻿from services.ollama_service import ollama_service
-from models.schemas import DualOption, ConvergenceCheck, ClarificationQuestions
+from models.schemas import (
+    DualOption, ConvergenceCheck, ClarificationQuestions, SynthesizedAnswer,
+    RouterDecision, DirectAnswer,
+)
 from prompts.agent_prompts import (
+    ROUTER_SYSTEM_PROMPT,
+    DIRECT_ANSWER_SYSTEM_PROMPT,
     CLARIFICATION_SYSTEM_PROMPT,
     IDEATOR_OPENING_PROMPT,
     IDEATOR_REBUTTAL_PROMPT,
     CRITIC_OPENING_PROMPT,
     CRITIC_REBUTTAL_PROMPT,
     CONVERGENCE_SYSTEM_PROMPT,
+    SYNTHESIS_SYSTEM_PROMPT,
 )
+
+
+class RouterAgent:
+    """LLM3 — triages every incoming query before anything else runs."""
+
+    def run(self, user_query: str) -> RouterDecision:
+        return ollama_service.generate_structured(
+            ROUTER_SYSTEM_PROMPT, f"User query: {user_query}", RouterDecision
+        )
+
+
+class DirectAnswerAgent:
+    """Single-call plain answer for DIRECT-mode queries. No debate involved."""
+
+    def run(self, user_query: str) -> DirectAnswer:
+        return ollama_service.generate_structured(
+            DIRECT_ANSWER_SYSTEM_PROMPT, f"User query: {user_query}", DirectAnswer
+        )
 
 
 class ClarificationAgent:
@@ -53,7 +77,18 @@ class ConvergenceAgent:
         )
 
 
+class SynthesisAgent:
+    """LLM3 — after the debate ends, synthesizes one final answer from the full transcript."""
+
+    def run(self, context: str, transcript_so_far: str) -> SynthesizedAnswer:
+        prompt = f"{context}\n\nFull debate transcript:\n{transcript_so_far}"
+        return ollama_service.generate_structured(SYNTHESIS_SYSTEM_PROMPT, prompt, SynthesizedAnswer)
+
+
 clarification_agent = ClarificationAgent()
 ideator_agent = IdeatorAgent()
 critic_agent = CriticAgent()
 convergence_agent = ConvergenceAgent()
+synthesis_agent = SynthesisAgent()
+router_agent = RouterAgent()
+direct_answer_agent = DirectAnswerAgent()

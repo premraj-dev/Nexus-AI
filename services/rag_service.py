@@ -1,45 +1,96 @@
-﻿import json
-import datetime
-from duckduckgo_search import DDGS
-from llm_client import call_local_llm
+﻿"""
+Nexus AI RAG service.
+
+Retrieves relevant passages from a local knowledge base (plain .md/.txt files
+in the knowledge/ folder) and grounds the LLM1/LLM2 debate in real facts
+instead of only model priors.
+
+Swap in your own dataset by dropping more .md/.txt files into knowledge/ —
+no code changes needed. Each file is chunked on blank-line/heading boundaries;
+retrieval is pure keyword overlap (no embeddings, no external API, no cost).
+This is intentionally simple and dependency-free so it's easy to explain and
+defend in an interview: swap this function body for a vector store later
+without touching the rest of the pipeline.
+"""
+
+import re
+from pathlib import Path
+from dataclasses import dataclass
+
+KNOWLEDGE_DIR = Path(__file__).parent.parent / "knowledge"
+
+STOPWORDS = {
+    "the", "a", "an", "is", "are", "was", "were", "and", "or", "but", "for",
+    "of", "to", "in", "on", "with", "vs", "versus", "should", "i", "my", "me",
+    "what", "which", "how", "do", "does", "it", "this", "that", "be", "as",
+    "best", "good", "better", "use", "using", "need", "want", "app", "project",
+}
+
+
+@dataclass
+class Chunk:
+    source: str
+    heading: str
+    text: str
+
+
+def _tokenize(text: str) -> set:
+    words = re.findall(r"[a-zA-Z][a-zA-Z0-9+#./-]*", text.lower())
+    return {w for w in words if w not in STOPWORDS and len(w) > 2}
+
+
+def _load_chunks() -> list[Chunk]:
+    chunks = []
+    if not KNOWLEDGE_DIR.exists():
+        return chunks
+    for path in KNOWLEDGE_DIR.glob("*.md"):
+        content = path.read_text(encoding="utf-8")
+        sections = re.split(r"\n---\n|\n(?=# )", content)
+        for section in sections:
+            section = section.strip()
+            if not section:
+                continue
+            heading_match = re.match(r"^#+\s*(.+)", section)
+            heading = heading_match.group(1).strip() if heading_match else path.stem
+            chunks.append(Chunk(source=path.name, heading=heading, text=section))
+    for path in KNOWLEDGE_DIR.glob("*.txt"):
+        content = path.read_text(encoding="utf-8")
+        for para in content.split("\n\n"):
+            para = para.strip()
+            if para:
+                chunks.append(Chunk(source=path.name, heading=path.stem, text=para))
+    return chunks
+
 
 class RAGService:
-    def fetch_research(self, query: str) -> dict:
-        current_date = datetime.date.today().strftime('%Y-%m-%d')
-        
-        # Mandatory query enrichment for 2026 temporal queries
-        search_query = f"Bollywood movies released in 2026 release date box office {query}"
-        raw_snippets = ""
-        
-        try:
-            with DDGS(timeout=5) as ddgs:
-                results = list(ddgs.text(search_query, max_results=6))
-                for r in results:
-                    raw_snippets += f"- Title: {r.get('title','')}\n  Snippet: {r.get('body','')}\n\n"
-        except Exception as e:
-            raw_snippets = f"Search failed: {str(e)}"
+    def __init__(self):
+        self._chunks = _load_chunks()
 
-        # Extraction Agent: Convert raw text into strictly validated JSON
-        extraction_system_prompt = (
-            f"You are a Strict Data Extraction Agent. Today's date is {current_date}.\n"
-            "Extract movies mentioned in the text that strictly belong to the year 2026.\n"
-            "Rules:\n"
-            "1. Extract ONLY movies released or scheduled for release in 2026.\n"
-            "2. Reject any movie released before 2026 (e.g., Pathaan, Tiger 3, Laal Singh Chaddha).\n"
-            "3. Separate into 'released_2026' and 'upcoming_2026'.\n"
-            "Return STRICT JSON only:\n"
-            "{\n"
-            '  "released_2026": [{"title": "", "release_date": "", "verdict": ""}],\n'
-            '  "upcoming_2026": [{"title": "", "release_date": "", "status": ""}],\n'
-            '  "verification_status": "SUCCESS" or "FAILED"\n'
-            "}"
-        )
-        
-        extracted_json = call_local_llm(f"RAW SEARCH DATA:\n{raw_snippets}", extraction_system_prompt)
-        
-        return {
-            "raw_context": raw_snippets,
-            "structured_data": extracted_json
-        }
+    def reload(self) -> None:
+        """Call after adding/editing files in knowledge/ without restarting the app."""
+        self._chunks = _load_chunks()
+
+    def fetch_research(self, query: str, top_k: int = 3) -> dict:
+        """Returns the top_k most relevant knowledge chunks for the query,
+        scored by keyword overlap. Returns empty context if nothing scores > 0
+        (e.g. the query is outside the knowledge base's topics) — the debate
+        agents fall back to model priors in that case."""
+        if not self._chunks:
+            return {"raw_context": "", "sources": []}
+
+        query_tokens = _tokenize(query)
+        scored = []
+        for chunk in self._chunks:
+            chunk_tokens = _tokenize(chunk.heading + " " + chunk.text)
+            overlap = len(query_tokens & chunk_tokens)
+            if overlap >= 2:  # single coincidental word match isn't enough signal
+                scored.append((overlap, chunk))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top = [c for _, c in scored[:top_k]]
+
+        raw_context = "\n\n".join(f"[Source: {c.source} — {c.heading}]\n{c.text}" for c in top)
+        return {"raw_context": raw_context, "sources": [c.source for c in top]}
+
 
 rag_service = RAGService()

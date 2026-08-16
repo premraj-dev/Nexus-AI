@@ -9,9 +9,10 @@ Flow (matches the target architecture):
   5. LLM3 judges convergence               -> convergence node
         - not converged & rounds remain -> loop back to step 3 (another round)
         - converged OR rounds exhausted -> extract
-  6. Extract Option A & Option B (no winner picked by the LLM)
-  7/8. UI display + user selection + SQLite logging happen OUTSIDE this graph,
-       in the calling app, once run_debate() returns a DebateResult.
+  6. Extract Option A & Option B (raw debate transcript)
+  7. LLM3 synthesizes ONE final answer from the full debate -> synthesize node
+  8. UI display + SQLite logging happen OUTSIDE this graph,
+     in the calling app, once run_debate() returns a DebateResult.
 """
 
 from typing import TypedDict, List, Dict, Any, Optional
@@ -23,8 +24,12 @@ from agents.debate_agents import (
     ideator_agent,
     critic_agent,
     convergence_agent,
+    synthesis_agent,
+    router_agent,
+    direct_answer_agent,
 )
-from models.schemas import DualOption, ClarificationQuestions, DebateResult
+from models.schemas import DualOption, ClarificationQuestions, DebateResult, SynthesizedAnswer, RouterDecision, DirectAnswer
+from services.rag_service import rag_service
 
 MAX_ROUNDS = 3
 
@@ -39,6 +44,7 @@ class DebateState(TypedDict):
     option_b: Optional[DualOption]
     converged: bool
     convergence_reasoning: str
+    synthesis: Optional[SynthesizedAnswer]
 
 
 def format_transcript(transcript: List[Dict[str, Any]]) -> str:
@@ -54,6 +60,11 @@ def context_prep_node(state: DebateState) -> Dict[str, Any]:
     combined = f"User Request: {state['user_query']}"
     if state.get("clarification_answers"):
         combined += f"\nUser Preferences:\n{state['clarification_answers']}"
+
+    research = rag_service.fetch_research(state["user_query"])
+    if research["raw_context"]:
+        combined += f"\n\nRelevant background research (ground your proposal in this where applicable):\n{research['raw_context']}"
+
     return {"context": combined, "round": 0, "transcript": []}
 
 
@@ -95,12 +106,19 @@ def extract_node(state: DebateState) -> Dict[str, Any]:
     return {}
 
 
+def synthesize_node(state: DebateState) -> Dict[str, Any]:
+    # LLM3 reads the full transcript and produces one final recommendation.
+    synthesis = synthesis_agent.run(state["context"], format_transcript(state["transcript"]))
+    return {"synthesis": synthesis}
+
+
 workflow = StateGraph(DebateState)
 workflow.add_node("context_prep", context_prep_node)
 workflow.add_node("ideator", ideator_node)
 workflow.add_node("critic", critic_node)
 workflow.add_node("convergence", convergence_node)
 workflow.add_node("extract", extract_node)
+workflow.add_node("synthesize", synthesize_node)
 
 workflow.set_entry_point("context_prep")
 workflow.add_edge("context_prep", "ideator")
@@ -111,9 +129,21 @@ workflow.add_conditional_edges(
     route_after_convergence,
     {"loop": "ideator", "extract": "extract"},
 )
-workflow.add_edge("extract", END)
+workflow.add_edge("extract", "synthesize")
+workflow.add_edge("synthesize", END)
 
 debate_graph = workflow.compile()
+
+
+def route_query(user_query: str) -> RouterDecision:
+    """Step 0 — LLM3 triages the query: DIRECT (plain answer) or DECISION (full debate)."""
+    return router_agent.run(user_query)
+
+
+def answer_direct(user_query: str) -> str:
+    """DIRECT-mode path — one plain LLM call, no debate, no clarification."""
+    result: DirectAnswer = direct_answer_agent.run(user_query)
+    return result.answer
 
 
 def generate_clarifying_questions(user_query: str) -> List[str]:
@@ -135,11 +165,13 @@ def run_debate(user_query: str, clarification_answers: str = "") -> DebateResult
         "option_b": None,
         "converged": False,
         "convergence_reasoning": "",
+        "synthesis": None,
     }
     final_state = debate_graph.invoke(initial_state)
     return DebateResult(
         option_a=final_state["option_a"],
         option_b=final_state["option_b"],
+        synthesis=final_state["synthesis"],
         rounds_run=final_state["round"],
         converged=final_state["converged"],
     )
