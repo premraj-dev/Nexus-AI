@@ -12,7 +12,7 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env"), o
 load_dotenv(override=True)
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-DEFAULT_MODEL = "llama-3.1-8b-instant"
+DEFAULT_MODEL = "openai/gpt-oss-20b"
 
 T = TypeVar("T", bound=BaseModel)
 
