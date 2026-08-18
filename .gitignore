@@ -5,3 +5,5 @@ __pycache__/
 .DS_Store
 *.gguf
 *.db
+
+nexus_ai.db
