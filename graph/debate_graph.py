@@ -27,8 +27,24 @@ from agents.debate_agents import (
     synthesis_agent,
     router_agent,
     direct_answer_agent,
+    live_answer_agent,
+    explanation_writer_agent,
+    explanation_reviewer_agent,
+    explanation_synthesis_agent,
+    explanation_fallback_agent,
 )
-from models.schemas import DualOption, ClarificationQuestions, DebateResult, SynthesizedAnswer, RouterDecision, DirectAnswer
+from models.schemas import (
+    DualOption,
+    ClarificationQuestions,
+    DebateResult,
+    SynthesizedAnswer,
+    RouterDecision,
+    DirectAnswer,
+    LiveResult,
+    ExplanationDraft,
+    ExplanationSynthesis,
+)
+from services.live_data_service import get_live_context, search_web
 from services.rag_service import rag_service
 
 MAX_ROUNDS = 3
@@ -37,6 +53,7 @@ MAX_ROUNDS = 3
 class DebateState(TypedDict):
     user_query: str
     clarification_answers: Optional[str]
+    conversation: Optional[str]
     context: str
     round: int
     transcript: List[Dict[str, Any]]  # [{"round": n, "option_a": DualOption, "option_b": DualOption}, ...]
@@ -58,6 +75,8 @@ def format_transcript(transcript: List[Dict[str, Any]]) -> str:
 
 def context_prep_node(state: DebateState) -> Dict[str, Any]:
     combined = f"User Request: {state['user_query']}"
+    if state.get("conversation"):
+        combined = f"Conversation so far:\n{state['conversation']}\n\n{combined}"
     if state.get("clarification_answers"):
         combined += f"\nUser Preferences:\n{state['clarification_answers']}"
 
@@ -135,29 +154,80 @@ workflow.add_edge("synthesize", END)
 debate_graph = workflow.compile()
 
 
-def route_query(user_query: str) -> RouterDecision:
-    """Step 0 — LLM3 triages the query: DIRECT (plain answer) or DECISION (full debate)."""
-    return router_agent.run(user_query)
+def route_query(user_query: str, conversation: str = "") -> RouterDecision:
+    """LLM3 triages the new message while considering the current chat."""
+    return router_agent.run(user_query, conversation)
 
 
-def answer_direct(user_query: str) -> str:
-    """DIRECT-mode path — one plain LLM call, no debate, no clarification."""
-    result: DirectAnswer = direct_answer_agent.run(user_query)
+def answer_explain(user_query: str, conversation: str = "") -> ExplanationSynthesis:
+    """Primary educational path with free evidence, source links, and a plain-text fallback."""
+    evidence_text = ""
+    sources: list[dict[str, str]] = []
+    try:
+        evidence = search_web(user_query, count=2)
+        evidence_text = evidence.get("context", "")
+        sources = evidence.get("sources", [])
+    except Exception as evidence_error:
+        print(f"Free evidence lookup skipped: {evidence_error}")
+
+    try:
+        draft: ExplanationDraft = explanation_writer_agent.run(
+            user_query, conversation, evidence_text
+        )
+        review: ExplanationDraft = explanation_reviewer_agent.run(
+            user_query, draft, evidence_text
+        )
+        result = explanation_synthesis_agent.run(
+            user_query, draft, review, evidence_text
+        )
+        if sources:
+            source_lines = "\n\n### Sources\n" + "\n".join(
+                f"- [{source['title']}]({source['url']})" for source in sources
+            )
+            result = ExplanationSynthesis(answer=result.answer + source_lines)
+        return result
+    except Exception as primary_error:
+        # Keep provider details in the terminal log, never in the user-facing answer.
+        print(f"Educational quality pipeline fallback: {primary_error}")
+        fallback_text = explanation_fallback_agent.run(user_query, conversation)
+        return ExplanationSynthesis(answer=fallback_text)
+
+
+def answer_direct(user_query: str, conversation: str = "") -> str:
+    """DIRECT mode remains concise but conversation-aware."""
+    result: DirectAnswer = direct_answer_agent.run(user_query, conversation)
     return result.answer
 
 
-def generate_clarifying_questions(user_query: str) -> List[str]:
-    """Step 2 of the flow — LLM3's clarification interview. Runs for every query."""
-    result: ClarificationQuestions = clarification_agent.run(user_query)
+def answer_live(user_query: str, decision: RouterDecision, conversation: str = "") -> LiveResult:
+    """LIVE-mode path — retrieve current data, then answer from that data only."""
+    if decision.tool == "weather" and not decision.location:
+        raise ValueError(
+            "Please include a city or location for weather, for example: "
+            "'What is today's weather in Mumbai?'"
+        )
+    live_data = get_live_context(decision.tool, user_query, decision.location)
+    return live_answer_agent.run(
+        user_query=user_query,
+        context=live_data["context"],
+        sources=live_data["sources"],
+        conversation=conversation,
+    )
+
+
+def generate_clarifying_questions(user_query: str, conversation: str = "") -> List[str]:
+    """LLM3 asks only questions that materially change a decision answer."""
+    result: ClarificationQuestions = clarification_agent.run(user_query, conversation)
     return result.questions
 
 
-def run_debate(user_query: str, clarification_answers: str = "") -> DebateResult:
+def run_debate(user_query: str, clarification_answers: str = "", conversation: str = "") -> DebateResult:
     """Steps 3-6 of the flow — the proposal/challenge/convergence loop.
     Call this after the user has answered the clarifying questions."""
     initial_state: DebateState = {
         "user_query": user_query,
         "clarification_answers": clarification_answers,
+        "conversation": conversation,
         "context": "",
         "round": 0,
         "transcript": [],

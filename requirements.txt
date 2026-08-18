@@ -6,3 +6,4 @@ pydantic-settings
 requests
 python-dotenv
 groq
+supabase

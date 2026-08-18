@@ -12,7 +12,8 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env"), o
 load_dotenv(override=True)
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-DEFAULT_MODEL = "openai/gpt-oss-20b"
+DEFAULT_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+STRUCTURED_MAX_TOKENS = int(os.getenv("GROQ_STRUCTURED_MAX_TOKENS", "1800"))
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -52,7 +53,7 @@ def generate_llm_response(prompt: str, system_prompt: str = "", model: str = DEF
         )
         return response.choices[0].message.content
     except Exception as e:
-        return f"Error executing model: {str(e)}"
+        raise RuntimeError("LLM provider request failed") from e
 
 
 class OllamaService:
@@ -61,6 +62,29 @@ class OllamaService:
 
     def generate(self, prompt: str, system_prompt: str = "", model: str = DEFAULT_MODEL) -> str:
         return generate_llm_response(prompt=prompt, system_prompt=system_prompt, model=model)
+
+    def generate_text(
+        self,
+        system_prompt: str,
+        user_content: str,
+        model: str = DEFAULT_MODEL,
+        max_tokens: int = 1200,
+    ) -> str:
+        """Generate normal prose for graceful fallback answers."""
+        key = os.getenv("GROQ_API_KEY", "")
+        if not key:
+            raise RuntimeError("GROQ_API_KEY is not configured.")
+        local_client = Groq(api_key=key)
+        response = local_client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            model=model,
+            temperature=0.25,
+            max_tokens=max_tokens,
+        )
+        return response.choices[0].message.content or ""
 
     def generate_structured(
         self,
@@ -92,8 +116,8 @@ class OllamaService:
             response = local_client.chat.completions.create(
                 messages=messages,
                 model=model,
-                temperature=0.4,
-                max_tokens=800,
+                temperature=0.2,
+                max_tokens=STRUCTURED_MAX_TOKENS,
                 response_format={"type": "json_object"},
             )
             raw = response.choices[0].message.content
